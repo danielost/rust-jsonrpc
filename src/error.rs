@@ -20,8 +20,10 @@
 use std::{error, fmt};
 
 use serde_json;
+use serde::{Serialize, Deserialize};
+use serde_derive::*;
 
-use Response;
+use super::Response;
 
 /// A library error
 #[derive(Debug)]
@@ -77,7 +79,7 @@ impl fmt::Display for Error {
 }
 
 impl error::Error for Error {
-    fn cause(&self) -> Option<&error::Error> {
+    fn cause(&self) -> Option<&dyn error::Error> {
         match *self {
             Error::Transport(ref e) => Some(&**e),
             Error::Json(ref e) => Some(e),

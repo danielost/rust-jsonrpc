@@ -11,8 +11,8 @@ use base64;
 use serde;
 use serde_json;
 
-use ::client::Transport;
-use ::{Request, Response};
+use crate::client::Transport;
+use super::{Request, Response};
 
 /// The default TCP port to use for connections.
 /// Set to 8332, the default RPC port for bitcoind.
@@ -145,7 +145,7 @@ impl Error {
     }
 }
 
-impl ::std::error::Error for Error {}
+impl std::error::Error for Error {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -172,11 +172,11 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<Error> for ::Error {
-    fn from(e: Error) -> ::Error {
+impl From<Error> for crate::Error {
+    fn from(e: Error) -> Self {
         match e {
-            Error::Json(e) => ::Error::Json(e),
-            e => ::Error::Transport(Box::new(e))
+            Error::Json(e) => crate::Error::Json(e),
+            e => crate::Error::Transport(Box::new(e))
         }
     }
 }
@@ -199,11 +199,11 @@ fn get_line<R: BufRead>(reader: &mut R, deadline: Instant) -> Result<String, Err
 }
 
 impl Transport for SimpleHttpTransport {
-    fn send_request(&self, req: Request) -> Result<Response, ::Error> {
+    fn send_request(&self, req: Request) -> Result<Response, crate::Error> {
         Ok(self.request(req)?)
     }
 
-    fn send_batch(&self, reqs: &[Request]) -> Result<Vec<Response>, ::Error> {
+    fn send_batch(&self, reqs: &[Request]) -> Result<Vec<Response>, crate::Error> {
         Ok(self.request(reqs)?)
     }
 
@@ -322,18 +322,19 @@ impl Builder {
     }
 }
 
-impl ::Client {
+use crate::client::Client;
+impl Client {
     /// Create a new JSON-RPC client using a bare-minimum HTTP transport.
     pub fn simple_http(
         url: &str,
         user: Option<String>,
         pass: Option<String>,
-    ) -> Result<::Client, Error> {
+    ) -> Result<Client, Error> {
         let mut builder = Builder::new().url(&url)?;
         if let Some(user) = user {
             builder = builder.auth(user, pass);
         }
-        Ok(::Client::with_transport(builder.build()))
+        Ok(Client::with_transport(builder.build()))
     }
 }
 
@@ -341,7 +342,7 @@ impl ::Client {
 mod tests {
     use std::net;
 
-    use ::Client;
+    use Client;
     use super::*;
 
     #[test]

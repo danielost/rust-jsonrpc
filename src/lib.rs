@@ -24,17 +24,12 @@
 #![deny(unused_mut)]
 #![warn(missing_docs)]
 
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-pub extern crate serde_json;
-
-#[cfg(feature = "base64-compat")]
-pub extern crate base64;
 
 pub mod client;
 pub mod error;
 mod util;
+use serde::{Serialize, Deserialize};
+use serde_derive::*;
 
 #[cfg(feature = "simple_http")]
 pub mod simple_http;
