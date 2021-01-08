@@ -24,19 +24,18 @@
 #![deny(unused_mut)]
 #![warn(missing_docs)]
 
-
 pub mod client;
 pub mod error;
 mod util;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_derive::*;
 
 #[cfg(feature = "simple_http")]
 pub mod simple_http;
 
 // Re-export error type
-pub use error::Error;
 pub use client::{Client, Transport};
+pub use error::Error;
 
 use serde_json::value::RawValue;
 
@@ -193,7 +192,7 @@ mod tests {
                 let arg = super::arg(val1.clone());
                 let val2: $t = serde_json::from_str(arg.get()).expect(stringify!($val));
                 assert_eq!(val1, val2, "failed test for {}", stringify!($val));
-            }}
+            }};
         }
 
         test_arg!(true, bool);
@@ -207,6 +206,11 @@ mod tests {
         struct Test {
             v: String,
         }
-        test_arg!(Test { v: String::from("test"), }, Test);
+        test_arg!(
+            Test {
+                v: String::from("test"),
+            },
+            Test
+        );
     }
 }
