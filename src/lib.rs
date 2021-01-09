@@ -116,6 +116,7 @@ impl Response {
 mod tests {
 
     use super::Response;
+    use serde_derive::*;
     use serde_json;
     use serde_json::value::RawValue;
 

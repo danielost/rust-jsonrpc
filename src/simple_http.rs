@@ -2,10 +2,10 @@
 //! round-tripper that works with the bitcoind RPC server. This can be used
 //! if minimal dependencies are a goal and synchronous communication is ok.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use std::{fmt, io, net, thread};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader, BufWriter};
+use tokio::net::{TcpStream, ToSocketAddrs};
 
 use base64;
 use serde;
@@ -43,6 +43,7 @@ impl Default for SimpleHttpTransport {
     }
 }
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 impl SimpleHttpTransport {
     /// Construct a new `SimpleHttpTransport` with default parameters
     pub fn new() -> Self {
@@ -54,41 +55,43 @@ impl SimpleHttpTransport {
         Builder::new()
     }
 
-    fn request<R>(&self, req: impl serde::Serialize) -> Result<R, Error>
+    async fn request<R>(&self, req: impl serde::Serialize) -> Result<R, Error>
     where
         R: for<'a> serde::de::Deserialize<'a>,
     {
         // Open connection
         let request_deadline = Instant::now() + self.timeout;
-        let mut sock = TcpStream::connect_timeout(&self.addr, self.timeout)?;
+        let sock = tokio::time::timeout(self.timeout, TcpStream::connect(self.addr)).await??;
+        let (read, write) = sock.into_split();
+        let mut writer = BufWriter::new(write);
 
         // Serialize the body first so we can set the Content-Length header.
         let body = serde_json::to_vec(&req)?;
 
         // Send HTTP request
-        sock.write_all(b"POST ")?;
-        sock.write_all(self.path.as_bytes())?;
-        sock.write_all(b" HTTP/1.1\r\n")?;
+        writer.write_all(b"POST ").await?;
+        writer.write_all(self.path.as_bytes()).await?;
+        writer.write_all(b" HTTP/1.1\r\n").await?;
         // Write headers
-        sock.write_all(b"Content-Type: application/json-rpc\r\n")?;
-        sock.write_all(b"Content-Length: ")?;
-        sock.write_all(body.len().to_string().as_bytes())?;
-        sock.write_all(b"\r\n")?;
+        writer.write_all(b"Content-Type: application/json-rpc\r\n").await?;
+        writer.write_all(b"Content-Length: ").await?;
+        writer.write_all(body.len().to_string().as_bytes()).await?;
+        writer.write_all(b"\r\n").await?;
         if let Some(ref auth) = self.basic_auth {
-            sock.write_all(b"Authorization: ")?;
-            sock.write_all(auth.as_ref())?;
-            sock.write_all(b"\r\n")?;
+            writer.write_all(b"Authorization: ").await?;
+            writer.write_all(auth.as_ref()).await?;
+            writer.write_all(b"\r\n").await?;
         }
         // Write body
-        sock.write_all(b"\r\n")?;
-        sock.write_all(&body)?;
-        sock.flush()?;
+        writer.write_all(b"\r\n").await?;
+        writer.write_all(&body).await?;
+        writer.flush().await?;
 
         // Receive response
-        let mut reader = BufReader::new(sock);
+        let mut reader = BufReader::new(read);
 
         // Parse first HTTP response header line
-        let http_response = get_line(&mut reader, request_deadline)?;
+        let http_response = get_line(&mut reader, request_deadline).await?;
         if http_response.len() < 12 || !http_response.starts_with("HTTP/1.1 ") {
             return Err(Error::HttpParseError);
         }
@@ -98,11 +101,11 @@ impl SimpleHttpTransport {
         };
 
         // Skip response header fields
-        while get_line(&mut reader, request_deadline)? != "\r\n" {}
+        while get_line(&mut reader, request_deadline).await? != "\r\n" {}
 
         // Even if it's != 200, we parse the response as we may get a JSONRPC error instead
         // of the less meaningful HTTP error code.
-        let resp_body = get_line(&mut reader, request_deadline)?;
+        let resp_body = get_line(&mut reader, request_deadline).await?;
         match serde_json::from_str(&resp_body) {
             Ok(s) => Ok(s),
             Err(e) => {
@@ -166,6 +169,12 @@ impl fmt::Display for Error {
         }
     }
 }
+use tokio::time::error::Elapsed;
+impl From<Elapsed> for Error {
+    fn from(e: Elapsed) -> Error {
+        Error::Timeout
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
@@ -190,10 +199,13 @@ impl From<Error> for crate::Error {
 
 /// Try to read a line from a buffered reader. If no line can be read till the deadline is reached
 /// return a timeout error.
-fn get_line<R: BufRead>(reader: &mut R, deadline: Instant) -> Result<String, Error> {
+async fn get_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    deadline: Instant,
+) -> Result<String, Error> {
     let mut line = String::new();
     while deadline > Instant::now() {
-        match reader.read_line(&mut line) {
+        match reader.read_line(&mut line).await {
             // EOF reached for now, try again later
             Ok(0) => thread::sleep(Duration::from_millis(5)),
             // received useful data, return it
@@ -205,13 +217,15 @@ fn get_line<R: BufRead>(reader: &mut R, deadline: Instant) -> Result<String, Err
     Err(Error::Timeout)
 }
 
+use async_trait::async_trait;
+#[async_trait]
 impl Transport for SimpleHttpTransport {
-    fn send_request(&self, req: Request) -> Result<Response, crate::Error> {
-        Ok(self.request(req)?)
+    async fn send_request(&self, req: Request<'_>) -> Result<Response, crate::Error> {
+        Ok(self.request(req).await?)
     }
 
-    fn send_batch(&self, reqs: &[Request]) -> Result<Vec<Response>, crate::Error> {
-        Ok(self.request(reqs)?)
+    async fn send_batch(&self, reqs: &[Request<'_>]) -> Result<Vec<Response>, crate::Error> {
+        Ok(self.request(reqs).await?)
     }
 
     fn fmt_target(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -240,7 +254,7 @@ impl Builder {
     }
 
     /// Set the URL of the server to the transport.
-    pub fn url(mut self, url: &str) -> Result<Self, Error> {
+    pub async fn url(mut self, url: &str) -> Result<Self, Error> {
         // Do some very basic manual URL parsing because the uri/url crates
         // all have unicode-normalization as a dependency and that's broken.
 
@@ -297,7 +311,7 @@ impl Builder {
             return Err(Error::url(url, "unexpected extra colon"));
         }
 
-        self.tp.addr = match (hostname, port).to_socket_addrs()?.next() {
+        self.tp.addr = match tokio::net::lookup_host((hostname, port)).await?.next() {
             Some(a) => a,
             None => {
                 return Err(Error::url(url, "invalid hostname: error extracting socket address"))
@@ -333,12 +347,12 @@ impl Builder {
 use crate::client::Client;
 impl Client {
     /// Create a new JSON-RPC client using a bare-minimum HTTP transport.
-    pub fn simple_http(
+    pub async fn simple_http(
         url: &str,
         user: Option<String>,
         pass: Option<String>,
     ) -> Result<Client, Error> {
-        let mut builder = Builder::new().url(&url)?;
+        let mut builder = Builder::new().url(&url).await?;
         if let Some(user) = user {
             builder = builder.auth(user, pass);
         }
@@ -353,9 +367,10 @@ mod tests {
     use super::*;
     use Client;
 
-    #[test]
-    fn test_urls() {
-        let addr: net::SocketAddr = ("localhost", 22).to_socket_addrs().unwrap().next().unwrap();
+    #[tokio::test]
+    async fn test_urls() {
+        let addr: net::SocketAddr =
+            tokio::net::lookup_host(("localhost", 22)).await.unwrap().next().unwrap();
         let urls = [
             "localhost:22",
             "http://localhost:22/",
@@ -363,20 +378,25 @@ mod tests {
             "http://me:weak@localhost:22/wallet",
         ];
         for u in &urls {
-            let tp = Builder::new().url(*u).unwrap().build();
+            let tp = Builder::new().url(*u).await.unwrap().build();
             assert_eq!(tp.addr, addr);
         }
 
         // Default port and 80 and 443 fill-in.
-        let addr: net::SocketAddr = ("localhost", 80).to_socket_addrs().unwrap().next().unwrap();
-        let tp = Builder::new().url("http://localhost/").unwrap().build();
-        assert_eq!(tp.addr, addr);
-        let addr: net::SocketAddr = ("localhost", 443).to_socket_addrs().unwrap().next().unwrap();
-        let tp = Builder::new().url("https://localhost/").unwrap().build();
+        let addr: net::SocketAddr =
+            tokio::net::lookup_host(("localhost", 80)).await.unwrap().next().unwrap();
+        let tp = Builder::new().url("http://localhost/").await.unwrap().build();
         assert_eq!(tp.addr, addr);
         let addr: net::SocketAddr =
-            ("localhost", super::DEFAULT_PORT).to_socket_addrs().unwrap().next().unwrap();
-        let tp = Builder::new().url("localhost").unwrap().build();
+            tokio::net::lookup_host(("localhost", 443)).await.unwrap().next().unwrap();
+        let tp = Builder::new().url("https://localhost/").await.unwrap().build();
+        assert_eq!(tp.addr, addr);
+        let addr: net::SocketAddr = tokio::net::lookup_host(("localhost", super::DEFAULT_PORT))
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        let tp = Builder::new().url("localhost").await.unwrap().build();
         assert_eq!(tp.addr, addr);
 
         let valid_urls = [
@@ -387,7 +407,7 @@ mod tests {
             "https://127.0.0.1/rpc/test",
         ];
         for u in &valid_urls {
-            Builder::new().url(*u).expect(&format!("error for: {}", u));
+            Builder::new().url(*u).await.expect(&format!("error for: {}", u));
         }
 
         let invalid_urls = [
@@ -398,23 +418,24 @@ mod tests {
             // NB somehow, Rust's IpAddr accepts "127.0.0" and adds the extra 0..
         ];
         for u in &invalid_urls {
-            if let Ok(b) = Builder::new().url(*u) {
+            if let Ok(b) = Builder::new().url(*u).await {
                 let tp = b.build();
                 panic!("expected error for url {}, got {:?}", u, tp);
             }
         }
     }
 
-    #[test]
-    fn construct() {
+    #[tokio::test]
+    async fn construct() {
         let tp = Builder::new()
             .timeout(Duration::from_millis(100))
             .url("localhost:22")
+            .await
             .unwrap()
             .auth("user", None)
             .build();
         let _ = Client::with_transport(tp);
 
-        let _ = Client::simple_http("localhost:22", None, None).unwrap();
+        let _ = Client::simple_http("localhost:22", None, None).await.unwrap();
     }
 }
