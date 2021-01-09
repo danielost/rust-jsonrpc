@@ -1,18 +1,18 @@
 [package]
-name = "jsonrpc"
-version = "0.12.0"
-authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
+name = "jsonrpc-async"
+version = "2.0.1"
+authors = ["Jeremy Rubin <j@rubin.io>", "Andrew Poelstra <apoelstra@wpsoftware.net>"]
 license = "CC0-1.0"
-homepage = "https://github.com/apoelstra/rust-jsonrpc/"
-repository = "https://github.com/apoelstra/rust-jsonrpc/"
-documentation = "https://docs.rs/jsonrpc/"
+homepage = "https://github.com/jeremyrubin/rust-jsonrpc-async/"
+repository = "https://github.com/jeremyrubin/rust-jsonrpc-async/"
+documentation = "https://docs.rs/jsonrpc-async/"
 description = "Rust support for the JSON-RPC 2.0 protocol"
-keywords = [ "protocol", "json", "http", "jsonrpc" ]
+keywords = [ "protocol", "json", "http", "jsonrpc", "asynchronous" ]
 readme	 = "README.md"
 edition="2018"
 
 [lib]
-name = "jsonrpc"
+name = "jsonrpc_async"
 path = "src/lib.rs"
 
 [features]
