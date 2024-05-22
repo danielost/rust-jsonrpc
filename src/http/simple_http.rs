@@ -4,10 +4,8 @@
 //! round-tripper that works with the bitcoind RPC server. This can be used
 //! if minimal dependencies are a goal and synchronous communication is ok.
 
-#[cfg(feature = "proxy")]
-use socks::Socks5Stream;
+use async_trait::async_trait;
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(not(jsonrpc_fuzz))]
 use std::net::TcpStream;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,8 +14,6 @@ use std::{error, fmt, io, net, num};
 
 use crate::client::Transport;
 use crate::http::DEFAULT_PORT;
-#[cfg(feature = "proxy")]
-use crate::http::DEFAULT_PROXY_PORT;
 use crate::{Request, Response};
 
 /// Absolute maximum content length allowed before cutting off the response.
@@ -25,9 +21,6 @@ const FINAL_RESP_ALLOC: u64 = 1024 * 1024 * 1024;
 
 #[cfg(not(jsonrpc_fuzz))]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[cfg(jsonrpc_fuzz)]
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Simple HTTP transport that implements the necessary subset of HTTP for
 /// running a bitcoind RPC client.
@@ -38,10 +31,6 @@ pub struct SimpleHttpTransport {
     timeout: Duration,
     /// The value of the `Authorization` HTTP header.
     basic_auth: Option<String>,
-    #[cfg(feature = "proxy")]
-    proxy_addr: net::SocketAddr,
-    #[cfg(feature = "proxy")]
-    proxy_auth: Option<(String, String)>,
     sock: Arc<Mutex<Option<BufReader<TcpStream>>>>,
 }
 
@@ -55,13 +44,6 @@ impl Default for SimpleHttpTransport {
             path: "/".to_owned(),
             timeout: DEFAULT_TIMEOUT,
             basic_auth: None,
-            #[cfg(feature = "proxy")]
-            proxy_addr: net::SocketAddr::new(
-                net::IpAddr::V4(net::Ipv4Addr::new(127, 0, 0, 1)),
-                DEFAULT_PROXY_PORT,
-            ),
-            #[cfg(feature = "proxy")]
-            proxy_auth: None,
             sock: Arc::new(Mutex::new(None)),
         }
     }
@@ -103,21 +85,6 @@ impl SimpleHttpTransport {
                 Err(err)
             }
         }
-    }
-
-    #[cfg(feature = "proxy")]
-    fn fresh_socket(&self) -> Result<TcpStream, Error> {
-        let stream = if let Some((username, password)) = &self.proxy_auth {
-            Socks5Stream::connect_with_password(
-                self.proxy_addr,
-                self.addr,
-                username.as_str(),
-                password.as_str(),
-            )?
-        } else {
-            Socks5Stream::connect(self.proxy_addr, self.addr)?
-        };
-        Ok(stream.into_inner())
     }
 
     #[cfg(not(feature = "proxy"))]
@@ -198,7 +165,9 @@ impl SimpleHttpTransport {
             });
         }
         if !header_buf.as_bytes()[..12].is_ascii() {
-            return Err(Error::HttpResponseNonAsciiHello(header_buf.as_bytes()[..12].to_vec()));
+            return Err(Error::HttpResponseNonAsciiHello(
+                header_buf.as_bytes()[..12].to_vec(),
+            ));
         }
         if !header_buf.starts_with("HTTP/1.1 ") {
             return Err(Error::HttpResponseBadHello {
@@ -336,21 +305,31 @@ fn check_url(url: &str) -> Result<(SocketAddr, String), Error> {
 
     match addr.next() {
         Some(a) => Ok((a, path.to_owned())),
-        None => Err(Error::url(url, "invalid hostname: error extracting socket address")),
+        None => Err(Error::url(
+            url,
+            "invalid hostname: error extracting socket address",
+        )),
     }
 }
 
+#[async_trait]
 impl Transport for SimpleHttpTransport {
-    fn send_request(&self, req: Request) -> Result<Response, crate::Error> {
+    async fn send_request(&self, req: Request<'_>) -> Result<Response, crate::Error> {
         Ok(self.request(req)?)
     }
 
-    fn send_batch(&self, reqs: &[Request]) -> Result<Vec<Response>, crate::Error> {
+    async fn send_batch(&self, reqs: &[Request<'_>]) -> Result<Vec<Response>, crate::Error> {
         Ok(self.request(reqs)?)
     }
 
     fn fmt_target(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "http://{}:{}{}", self.addr.ip(), self.addr.port(), self.path)
+        write!(
+            f,
+            "http://{}:{}{}",
+            self.addr.ip(),
+            self.addr.port(),
+            self.path
+        )
     }
 }
 
@@ -393,23 +372,10 @@ impl Builder {
 
     /// Adds authentication information to the transport using a cookie string ('user:pass').
     pub fn cookie_auth<S: AsRef<str>>(mut self, cookie: S) -> Self {
-        self.tp.basic_auth = Some(format!("Basic {}", &base64::encode(cookie.as_ref().as_bytes())));
-        self
-    }
-
-    /// Adds proxy address to the transport for SOCKS5 proxy.
-    #[cfg(feature = "proxy")]
-    pub fn proxy_addr<S: AsRef<str>>(mut self, proxy_addr: S) -> Result<Self, Error> {
-        // We don't expect path in proxy address.
-        self.tp.proxy_addr = check_url(proxy_addr.as_ref())?.0;
-        Ok(self)
-    }
-
-    /// Adds optional proxy authentication as ('username', 'password').
-    #[cfg(feature = "proxy")]
-    pub fn proxy_auth<S: AsRef<str>>(mut self, user: S, pass: S) -> Self {
-        self.tp.proxy_auth =
-            Some((user, pass)).map(|(u, p)| (u.as_ref().to_string(), p.as_ref().to_string()));
+        self.tp.basic_auth = Some(format!(
+            "Basic {}",
+            &base64::encode(cookie.as_ref().as_bytes())
+        ));
         self
     }
 
@@ -437,27 +403,6 @@ impl crate::Client {
             builder = builder.auth(user, pass);
         }
         Ok(crate::Client::with_transport(builder.build()))
-    }
-
-    /// Creates a new JSON_RPC client using a HTTP-Socks5 proxy transport.
-    #[cfg(feature = "proxy")]
-    pub fn http_proxy(
-        url: &str,
-        user: Option<String>,
-        pass: Option<String>,
-        proxy_addr: &str,
-        proxy_auth: Option<(&str, &str)>,
-    ) -> Result<crate::Client, Error> {
-        let mut builder = Builder::new().url(url)?;
-        if let Some(user) = user {
-            builder = builder.auth(user, pass);
-        }
-        builder = builder.proxy_addr(proxy_addr)?;
-        if let Some((user, pass)) = proxy_auth {
-            builder = builder.proxy_auth(user, pass);
-        }
-        let tp = builder.build();
-        Ok(crate::Client::with_transport(tp))
     }
 }
 
@@ -539,7 +484,11 @@ impl fmt::Display for Error {
                 ref actual,
                 ref needed,
             } => {
-                write!(f, "HTTP response too short: length {}, needed {}.", actual, needed)
+                write!(
+                    f,
+                    "HTTP response too short: length {}, needed {}.",
+                    actual, needed
+                )
             }
             HttpResponseNonAsciiHello(ref bytes) => {
                 write!(f, "HTTP response started with non-ASCII {:?}", bytes)
@@ -548,19 +497,32 @@ impl fmt::Display for Error {
                 ref actual,
                 ref expected,
             } => {
-                write!(f, "HTTP response started with `{}`; expected `{}`.", actual, expected)
+                write!(
+                    f,
+                    "HTTP response started with `{}`; expected `{}`.",
+                    actual, expected
+                )
             }
             HttpResponseBadStatus(ref status, ref err) => {
-                write!(f, "HTTP response had bad status code `{}`: {}.", status, err)
+                write!(
+                    f,
+                    "HTTP response had bad status code `{}`: {}.",
+                    status, err
+                )
             }
             HttpResponseBadContentLength(ref len, ref err) => {
-                write!(f, "HTTP response had bad content length `{}`: {}.", len, err)
+                write!(
+                    f,
+                    "HTTP response had bad content length `{}`: {}.",
+                    len, err
+                )
             }
-            HttpResponseContentLengthTooLarge {
-                length,
-                max,
-            } => {
-                write!(f, "HTTP response content length {} exceeds our max {}.", length, max)
+            HttpResponseContentLengthTooLarge { length, max } => {
+                write!(
+                    f,
+                    "HTTP response content length {} exceeds our max {}.",
+                    length, max
+                )
             }
             HttpErrorCode(c) => write!(f, "unexpected HTTP code: {}", c),
             IncompleteResponse {
@@ -575,7 +537,10 @@ impl fmt::Display for Error {
             }
             Json(ref e) => write!(f, "JSON error: {}", e),
             HttpResponseChunked => {
-                write!(f, "The server replied with a chunked response which is not supported")
+                write!(
+                    f,
+                    "The server replied with a chunked response which is not supported"
+                )
             }
         }
     }
@@ -586,25 +551,15 @@ impl error::Error for Error {
         use self::Error::*;
 
         match *self {
-            InvalidUrl {
-                ..
-            }
-            | HttpResponseTooShort {
-                ..
-            }
+            InvalidUrl { .. }
+            | HttpResponseTooShort { .. }
             | HttpResponseNonAsciiHello(..)
-            | HttpResponseBadHello {
-                ..
-            }
+            | HttpResponseBadHello { .. }
             | HttpResponseBadStatus(..)
             | HttpResponseBadContentLength(..)
-            | HttpResponseContentLengthTooLarge {
-                ..
-            }
+            | HttpResponseContentLengthTooLarge { .. }
             | HttpErrorCode(_)
-            | IncompleteResponse {
-                ..
-            }
+            | IncompleteResponse { .. }
             | HttpResponseChunked => None,
             SocketError(ref e) => Some(e),
             Json(ref e) => Some(e),
@@ -633,52 +588,9 @@ impl From<Error> for crate::Error {
     }
 }
 
-/// Global mutex used by the fuzzing harness to inject data into the read end of the TCP stream.
-#[cfg(jsonrpc_fuzz)]
-pub static FUZZ_TCP_SOCK: Mutex<Option<io::Cursor<Vec<u8>>>> = Mutex::new(None);
-
-#[cfg(jsonrpc_fuzz)]
-#[derive(Clone, Debug)]
-struct TcpStream;
-
-#[cfg(jsonrpc_fuzz)]
-mod impls {
-    use super::*;
-    impl Read for TcpStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            match *FUZZ_TCP_SOCK.lock().unwrap() {
-                Some(ref mut cursor) => io::Read::read(cursor, buf),
-                None => Ok(0),
-            }
-        }
-    }
-    impl Write for TcpStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            io::sink().write(buf)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl TcpStream {
-        pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<Self> {
-            Ok(TcpStream)
-        }
-        pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-            Ok(())
-        }
-        pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net;
-    #[cfg(feature = "proxy")]
-    use std::str::FromStr;
 
     use super::*;
     use crate::Client;
@@ -701,11 +613,18 @@ mod tests {
         let addr: net::SocketAddr = ("localhost", 80).to_socket_addrs().unwrap().next().unwrap();
         let tp = Builder::new().url("http://localhost/").unwrap().build();
         assert_eq!(tp.addr, addr);
-        let addr: net::SocketAddr = ("localhost", 443).to_socket_addrs().unwrap().next().unwrap();
+        let addr: net::SocketAddr = ("localhost", 443)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
         let tp = Builder::new().url("https://localhost/").unwrap().build();
         assert_eq!(tp.addr, addr);
-        let addr: net::SocketAddr =
-            ("localhost", super::DEFAULT_PORT).to_socket_addrs().unwrap().next().unwrap();
+        let addr: net::SocketAddr = ("localhost", super::DEFAULT_PORT)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
         let tp = Builder::new().url("localhost").unwrap().build();
         assert_eq!(tp.addr, addr);
 
@@ -720,13 +639,13 @@ mod tests {
         ];
         for u in &valid_urls {
             let (addr, path) = check_url(u).unwrap();
-            let builder = Builder::new().url(u).unwrap_or_else(|_| panic!("error for: {}", u));
+            let builder = Builder::new()
+                .url(u)
+                .unwrap_or_else(|_| panic!("error for: {}", u));
             assert_eq!(builder.tp.addr, addr);
             assert_eq!(builder.tp.path, path);
             assert_eq!(builder.tp.timeout, DEFAULT_TIMEOUT);
             assert_eq!(builder.tp.basic_auth, None);
-            #[cfg(feature = "proxy")]
-            assert_eq!(builder.tp.proxy_addr, SocketAddr::from_str("127.0.0.1:9050").unwrap());
         }
 
         let invalid_urls = [
@@ -757,34 +676,11 @@ mod tests {
         let _ = Client::simple_http("localhost:22", None, None).unwrap();
     }
 
-    #[cfg(feature = "proxy")]
-    #[test]
-    fn construct_with_proxy() {
-        let tp = Builder::new()
-            .timeout(Duration::from_millis(100))
-            .url("localhost:22")
-            .unwrap()
-            .auth("user", None)
-            .proxy_addr("127.0.0.1:9050")
-            .unwrap()
-            .build();
-        let _ = Client::with_transport(tp);
-
-        let _ = Client::http_proxy(
-            "localhost:22",
-            None,
-            None,
-            "127.0.0.1:9050",
-            Some(("user", "password")),
-        )
-        .unwrap();
-    }
-
     /// Test that the client will detect that a socket is closed and open a fresh one before sending
     /// the request
     #[cfg(all(not(feature = "proxy"), not(jsonrpc_fuzz)))]
-    #[test]
-    fn request_to_closed_socket() {
+    #[tokio::test]
+    async fn request_to_closed_socket() {
         use serde_json::{Number, Value};
         use std::net::{Shutdown, TcpListener};
         use std::sync::mpsc;
@@ -816,7 +712,9 @@ mod tests {
 
                 stream.write_all(b"HTTP/1.1 200\r\n").unwrap();
                 stream.write_all(b"Content-Length: ").unwrap();
-                stream.write_all(response_str.len().to_string().as_bytes()).unwrap();
+                stream
+                    .write_all(response_str.len().to_string().as_bytes())
+                    .unwrap();
                 stream.write_all(b"\r\n").unwrap();
                 stream.write_all(b"\r\n").unwrap();
                 stream.write_all(response_str.as_bytes()).unwrap();
@@ -833,11 +731,11 @@ mod tests {
         let client =
             Client::simple_http(format!("localhost:{}", port).as_str(), None, None).unwrap();
         let request = client.build_request("test_request", None);
-        let result = client.send_request(request).unwrap();
+        let result = client.send_request(request).await.unwrap();
         assert_eq!(result.id, Value::Number(Number::from(0)));
         thread::sleep(Duration::from_secs(1));
         let request = client.build_request("test_request2", None);
-        let result2 = client.send_request(request)
+        let result2 = client.send_request(request).await
             .expect("This second request should not be an Err like `Err(Transport(HttpResponseTooShort { actual: 0, needed: 12 }))`");
         assert_eq!(result2.id, Value::Number(Number::from(1)));
     }

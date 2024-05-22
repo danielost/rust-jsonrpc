@@ -31,12 +31,6 @@ pub use http::simple_http;
 #[cfg(feature = "minreq_http")]
 pub use http::minreq_http;
 
-#[cfg(feature = "simple_tcp")]
-pub mod simple_tcp;
-
-#[cfg(all(feature = "simple_uds", not(windows)))]
-pub mod simple_uds;
-
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 

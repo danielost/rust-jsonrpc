@@ -16,16 +16,15 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::{Request, Response};
-use crate::util::HashableValue;
 use async_trait::async_trait;
 
 /// An interface for a transport over which to use the JSONRPC protocol.
 #[async_trait]
 pub trait Transport: Send + Sync + 'static {
     /// Sends an RPC request over the transport.
-    async fn send_request(&self, _: Request) -> Result<Response, Error>;
+    async fn send_request(&self, _: Request<'_>) -> Result<Response, Error>;
     /// Sends a batch of RPC requests over the transport.
-    async fn send_batch(&self, _: &[Request]) -> Result<Vec<Response>, Error>;
+    async fn send_batch(&self, _: &[Request<'_>]) -> Result<Vec<Response>, Error>;
     /// Formats the target of this transport. I.e. the URL/socket/...
     fn fmt_target(&self, f: &mut fmt::Formatter) -> fmt::Result;
 }
@@ -63,7 +62,7 @@ impl Client {
     }
 
     /// Sends a request to a client.
-    pub async fn send_request(&self, request: Request) -> Result<Response, Error> {
+    pub async fn send_request(&self, request: Request<'_>) -> Result<Response, Error> {
         self.transport.send_request(request).await
     }
 
@@ -76,7 +75,10 @@ impl Client {
     ///
     /// The return vector holds the response for the request at the corresponding index. If no
     /// response was provided, it's [`None`].
-    pub async fn send_batch(&self, requests: &[Request]) -> Result<Vec<Option<Response>>, Error> {
+    pub async fn send_batch(
+        &self,
+        requests: &[Request<'_>],
+    ) -> Result<Vec<Option<Response>>, Error> {
         if requests.is_empty() {
             return Err(Error::EmptyBatch);
         }
@@ -99,8 +101,10 @@ impl Client {
             }
         }
         // Match responses to the requests.
-        let results =
-            requests.iter().map(|r| by_id.remove(&HashableValue(Cow::Borrowed(&r.id)))).collect();
+        let results = requests
+            .iter()
+            .map(|r| by_id.remove(&HashableValue(Cow::Borrowed(&r.id))))
+            .collect();
 
         // Since we're also just producing the first duplicate ID, we can also just produce the
         // first incorrect ID in case there are multiple.
@@ -213,10 +217,10 @@ mod tests {
     struct DummyTransport;
     #[async_trait]
     impl Transport for DummyTransport {
-        async fn send_request(&self, _: Request) -> Result<Response, Error> {
+        async fn send_request(&self, _: Request<'_>) -> Result<Response, Error> {
             Err(Error::NonceMismatch)
         }
-        async fn send_batch(&self, _: &[Request]) -> Result<Vec<Response>, Error> {
+        async fn send_batch(&self, _: &[Request<'_>]) -> Result<Vec<Response>, Error> {
             Ok(vec![])
         }
         fn fmt_target(&self, _: &mut fmt::Formatter) -> fmt::Result {
@@ -240,10 +244,12 @@ mod tests {
         let val = HashableValue(Cow::Owned(Value::from_str("null").unwrap()));
         let t = HashableValue(Cow::Owned(Value::from_str("true").unwrap()));
         let f = HashableValue(Cow::Owned(Value::from_str("false").unwrap()));
-        let ns =
-            HashableValue(Cow::Owned(Value::from_str("[0, -0, 123.4567, -100000000]").unwrap()));
-        let m =
-            HashableValue(Cow::Owned(Value::from_str("{ \"field\": 0, \"field\": -0 }").unwrap()));
+        let ns = HashableValue(Cow::Owned(
+            Value::from_str("[0, -0, 123.4567, -100000000]").unwrap(),
+        ));
+        let m = HashableValue(Cow::Owned(
+            Value::from_str("{ \"field\": 0, \"field\": -0 }").unwrap(),
+        ));
 
         let mut coll = HashSet::new();
 
